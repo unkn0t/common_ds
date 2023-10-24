@@ -2,6 +2,10 @@
 /// Inspired by https://codeforces.com/blog/entry/18051
 /// ---------------------------------------------------
 
+mod iter;
+
+pub use iter::Iter;
+
 use std::ops::{RangeBounds, Bound};
 
 /// We can not ensure this requirments with Rust
@@ -31,6 +35,20 @@ where
     delayed: Vec<T>,
     lazy_fn: L,
     neutral: T,
+}
+
+
+/// We can not ensure this requirments with Rust
+/// (1) segment(a, k) = merge(merge(..., a), a) {k times}
+pub struct AssignmentSegmentTree<T, M, S> 
+where
+    T: Copy,
+    M: Fn(T, T) -> T,
+    S: Fn(T, usize) -> T,
+{
+    tree: SegmentTree<T, M>,
+    delayed: Vec<Option<T>>,
+    segment_fn: S,
 }
 
 impl<T, M> SegmentTree<T, M> 
@@ -67,7 +85,7 @@ where
         }
     }
     
-    pub fn assign(&mut self, position: usize, value: T) {
+    pub fn assign_single(&mut self, position: usize, value: T) {
         let mut vertex = self.vertex_from_position(position);
         self.data[vertex] = value;
 
@@ -105,7 +123,19 @@ where
         }
 
         self.merge(left_res, right_res)
-    }   
+    }
+    
+    // FIXME: we want to use iter to solve problems 
+    // like find kth zero, but now we can only use
+    // it when self.len() is power of 2
+    pub fn iter(&self) -> Iter<'_, T, M> {
+        assert!(self.len().is_power_of_two());
+        Iter::new(&self)
+    }
+
+    pub fn with_assignment<S: Fn(T, usize) -> T>(self, segment_fn: S) -> AssignmentSegmentTree<T, M, S> {
+        AssignmentSegmentTree::new(self, segment_fn)
+    }
  
     #[inline]
     pub fn len(&self) -> usize {
@@ -136,6 +166,16 @@ where
         };
 
         (left, right)
+    }
+}
+
+impl<T, M> SegmentTree<T, M> 
+where
+    T: Copy + Eq,
+    M: Fn(T, T) -> T,
+{
+    pub fn with_lazy<L: Fn(T, T) -> T>(self, lazy_fn: L, neutral: T) -> LazySegmentTree<T, M, L> {
+        LazySegmentTree::new(self, lazy_fn, neutral)
     }
 }
 
@@ -267,6 +307,158 @@ where
     }
 }
 
+impl<T, M, S> AssignmentSegmentTree<T, M, S> 
+where
+    T: Copy,
+    M: Fn(T, T) -> T,
+    S: Fn(T, usize) -> T,
+{
+    const START_VERTEX: usize = SegmentTree::<T, M>::START_VERTEX;
+
+    pub fn new(tree: SegmentTree<T, M>, segment_fn: S) -> Self {
+        let delayed = vec![None; tree.len()];
+
+        Self {
+            tree,
+            delayed,
+            segment_fn,
+        }
+    }
+   
+    pub fn assign_single(&mut self, position: usize, value: T) {
+        self.push(position, position + 1);
+
+        let vertex = self.tree.vertex_from_position(position);
+        self.apply(vertex, value, 1);
+        self.build(position, position + 1);
+    }
+ 
+    pub fn assign_range<R: RangeBounds<usize>>(&mut self, range: R, value: T) {
+        let (left, right) = self.tree.range_into_segment(range);
+        self.assign(left, right, value)
+    }
+
+    pub fn assign(&mut self, left: usize, right: usize, value: T) {
+        self.push(left, left + 1);
+        self.push(right, right + 1);
+        
+        let mut left_vertex = self.tree.vertex_from_position(left);
+        let mut right_vertex = self.tree.vertex_from_position(right + 1);
+        let mut seg_len = 1;
+
+        while left_vertex < right_vertex {
+            if (left_vertex & 1) == 1 {
+                self.apply(left_vertex, value, seg_len);
+                left_vertex += 1;
+            }
+            
+            if (right_vertex & 1) == 1 {
+                right_vertex -= 1;
+                self.apply(right_vertex, value, seg_len);
+            }
+
+            left_vertex = parent(left_vertex);
+            right_vertex = parent(right_vertex);
+            seg_len <<= 1;
+        }
+
+        self.build(left, left + 1);
+        self.build(right, right + 1);
+    }
+   
+    pub fn query_range<R: RangeBounds<usize>>(&mut self, range: R) -> T {
+        let (left, right) = self.tree.range_into_segment(range);
+        self.query(left, right)
+    }
+
+    pub fn query(&mut self, left: usize, right: usize) -> T {
+        self.push(left, left + 1);
+        self.push(right, right + 1);
+   
+        self.tree.query(left, right)
+    }   
+    
+    pub fn init_with(&mut self, values: &[T]) {
+        self.tree.init_with(values);        
+        self.delayed.clear();
+        self.delayed.resize(values.len(), None);
+    }
+
+    fn build(&mut self, left: usize, right: usize) {
+        let mut seg_len = 2;
+        
+        let mut left_vertex = self.tree.vertex_from_position(left);
+        let mut right_vertex = self.tree.vertex_from_position(right - 1);
+
+        while left_vertex > Self::START_VERTEX {
+            left_vertex = parent(left_vertex);
+            right_vertex = parent(right_vertex);
+            
+            for vertex in (left_vertex..=right_vertex).rev() {
+                self.recalculate(vertex, seg_len);
+            }
+
+            seg_len <<= 1;
+        }
+    }
+
+    fn recalculate(&mut self, vertex: usize, seg_len: usize) {
+        match self.delayed[vertex] {
+            Some(delayed) => self.tree.data[vertex] = self.segment(delayed, seg_len),
+            None => {
+                let (left, right) = children(vertex);
+                self.tree.data[vertex] = self.tree.merge(self.tree.data[left], self.tree.data[right]);
+            } 
+        }
+    }
+
+    fn push(&mut self, left: usize, right: usize) {
+        let mut height = self.height();
+        let mut seg_len = 1 << (height - 1);
+
+        let left_vertex = self.tree.vertex_from_position(left);
+        let right_vertex = self.tree.vertex_from_position(right - 1);
+
+        while height > 0 {
+            for vertex in (left_vertex >> height)..=(right_vertex >> height) {
+                if let Some(delayed) = self.delayed[vertex] {
+                    let (left_child, right_child) = children(vertex);
+                    self.apply(left_child, delayed, seg_len); 
+                    self.apply(right_child, delayed, seg_len); 
+                    self.delayed[vertex] = None;
+                }
+            }
+
+            seg_len >>= 1;
+            height -= 1;
+        }
+    }
+
+    fn apply(&mut self, vertex: usize, value: T, seg_len: usize) {
+        self.tree.data[vertex] = self.segment(value, seg_len);
+        
+        if self.is_not_leaf(vertex) {
+            self.delayed[vertex] = Some(value); 
+        }
+    }
+
+    #[inline]
+    fn height(&self) -> usize {
+        let len = self.tree.len();
+        (usize::BITS - len.leading_zeros()) as usize
+    }
+
+    #[inline]
+    fn is_not_leaf(&self, vertex: usize) -> bool {
+        vertex < self.tree.len()
+    }
+
+    #[inline]
+    fn segment(&self, value: T, len: usize) -> T {
+        (self.segment_fn)(value, len)
+    }
+}
+
 #[inline]
 const fn parent(vertex: usize) -> usize {
     vertex >> 1
@@ -288,7 +480,7 @@ mod tests {
         let mut values = [1, 3, 2, 5, 4];
         let mut segtree = SegmentTree::build(&values, i32::min, i32::MAX);
 
-        segtree.assign(2, 4);
+        segtree.assign_single(2, 4);
         values[2] = 4;
 
         for l in 0..values.len() {
@@ -301,8 +493,8 @@ mod tests {
     #[test]
     fn lazy_segment_tree() {
         let mut values = [1, 3, 2, 5, 4];
-        let segtree = SegmentTree::build(&values, i32::max, i32::MIN);
-        let mut segtree = LazySegmentTree::new(segtree, <i32 as Add>::add, 0);
+        let mut segtree = SegmentTree::build(&values, i32::max, i32::MIN)
+            .with_lazy(<i32 as Add>::add, 0);
 
         segtree.modify(0, 2, 2);
         
@@ -313,6 +505,25 @@ mod tests {
         for l in 0..values.len() {
             for r in l..values.len() {
                 assert_eq!(segtree.query(l, r), *values[l..=r].iter().max().unwrap(), "l: {l}, r: {r}");
+            }
+        }
+    }
+    
+    #[test]
+    fn assignment_segment_tree() {
+        let mut values = [1, 3, 2, 5, 4];
+        let mut segtree = SegmentTree::build(&values, i32::min, i32::MAX)
+            .with_assignment(|x, _k| x);
+
+        segtree.assign(0, 2, 2);
+        
+        for i in 0..=2 {
+            values[i] = 2;
+        }
+
+        for l in 0..values.len() {
+            for r in l..values.len() {
+                assert_eq!(segtree.query(l, r), *values[l..=r].iter().min().unwrap(), "l: {l}, r: {r}");
             }
         }
     }
